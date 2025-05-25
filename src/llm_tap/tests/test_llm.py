@@ -8,6 +8,7 @@ from llm_tap.llm import (
     to_json_schema,
     from_dict,
     make_helper,
+    prepare_for_tool_use,
 )
 
 
@@ -404,5 +405,376 @@ class TestLLMUtils(unittest.TestCase):
         self.assertIn("choice (Union) (required)", helper_str)
 
 
+class TestPrepareForToolUse(unittest.TestCase):
+    def setUp(self):
+        self.sample_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            },
+                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        self.helper_prompt = "You have access to the following tools. Use them if applicable."
+        self.user_prompt = "What's the weather like in Boston?"
+        self.system_prompt = "You are a helpful assistant."
+        self.model_name = "gpt-4-test"
+
+    def test_prepare_for_tool_use_basic(self):
+        """Test basic payload construction for tool use."""
+        payload = prepare_for_tool_use(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+        )
+
+        expected_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.helper_prompt},
+            {"role": "user", "content": self.user_prompt},
+        ]
+        self.assertEqual(payload["messages"], expected_messages)
+        self.assertEqual(payload["tools"], self.sample_tools)
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(payload["parallel_tool_calls"], False)
+        self.assertEqual(payload["temperature"], 0.0)
+        self.assertNotIn("model", payload) # Model is None by default
+
+    def test_prepare_for_tool_use_with_model(self):
+        """Test payload construction with a specified model."""
+        payload = prepare_for_tool_use(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+            model=self.model_name,
+        )
+        self.assertEqual(payload["model"], self.model_name)
+
+    def test_prepare_for_tool_use_no_model(self):
+        """Test payload construction when model is explicitly None."""
+        payload = prepare_for_tool_use(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+            model=None,
+        )
+        self.assertNotIn("model", payload) # Model should not be in payload if None
+
+
 if __name__ == "__main__":
+    # We need to import prepare_for_tool_use here or at the top of the file
+    # For the sake of this diff, assuming it's imported at the top of the file like other functions.
+    # from llm_tap.llm import prepare_for_tool_use # Ensure this is at the top
     unittest.main(argv=["first-arg-is-ignored"], exit=False)
+
+
+# Imports for adapter tests
+import requests 
+import time 
+from unittest.mock import patch, MagicMock
+from llm_tap.llm import HTTP # Assuming LLamaCPP will be tested separately or imported here too
+
+
+class TestHTTPAdapterToolInteraction(unittest.TestCase):
+    def setUp(self):
+        self.base_url = "http://fakeapi.com/chat"
+        self.api_key = "fake_key"
+        self.default_model_name = "gpt-http-default"
+        # Initialize adapter with a default model
+        self.adapter = HTTP(base_url=self.base_url, api_key=self.api_key, model=self.default_model_name)
+
+        self.sample_tools = [{"type": "function", "function": {"name": "test_tool"}}]
+        self.helper_prompt = "Use tools."
+        self.user_prompt = "Call test_tool."
+        self.system_prompt = "System message for tools."
+        # This is what prepare_for_tool_use is expected to return
+        self.prepared_payload_default_model = {
+            "messages": [], "tools": self.sample_tools, "tool_choice": "auto", 
+            "model": self.default_model_name, "temperature": 0.0, "parallel_tool_calls": False
+        }
+        self.prepared_payload_override_model = {
+            "messages": [], "tools": self.sample_tools, "tool_choice": "auto",
+            "model": "gpt-override", "temperature": 0.0, "parallel_tool_calls": False
+        }
+        self.llm_response_json = {"id": "chatcmpl-123", "choices": [{"message": {"role": "assistant"}}]}
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('requests.Session.post')
+    def test_execute_tool_interaction_success_with_default_model(self, mock_post, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload_default_model
+        mock_response = MagicMock()
+        mock_response.json.return_value = self.llm_response_json
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        response = self.adapter.execute_tool_interaction(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt
+            # No model specified, should use adapter's default
+        )
+
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, self.default_model_name
+        )
+
+# Need to import LLamaCPP and llama_cpp (for mocking)
+from llm_tap.llm import LLamaCPP
+import llama_cpp # Mocked
+import os # For mocking os.path.expanduser
+
+class TestLLamaCPPAdapterToolInteraction(unittest.TestCase):
+    def setUp(self):
+        self.model_path = "/fake/path/to/model.gguf"
+        self.adapter = LLamaCPP(model=self.model_path, n_ctx=2048, n_gpu_layers=10, n_threads=2)
+
+        self.sample_tools = [{"type": "function", "function": {"name": "test_tool_llama"}}]
+        self.helper_prompt = "Use Llama tools."
+        self.user_prompt = "Call test_tool_llama."
+        self.system_prompt = "Llama system message."
+        self.prepared_payload = {
+            "messages": [{"role": "system", "content": self.system_prompt}], 
+            "tools": self.sample_tools, 
+            "tool_choice": "auto",
+            "temperature": 0.1, # Example temperature from payload
+            "parallel_tool_calls": False
+        }
+        self.llm_response_dict = {
+            "choices": [{"message": {"tool_calls": [{"function": {"name": "test_tool_llama", "arguments": "{}"}}]}}]
+        }
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('llama_cpp.Llama')
+    @patch('os.path.expanduser', return_value=lambda x: x) # Mock expanduser
+    def test_execute_tool_interaction_success(self, mock_expanduser, mock_llama_constructor, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload
+        mock_llama_instance = MagicMock()
+        mock_llama_instance.create_chat_completion.return_value = self.llm_response_dict
+        mock_llama_constructor.return_value = mock_llama_instance
+
+        response = self.adapter.execute_tool_interaction(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt
+            # No model override, adapter's model (path) will be used for Llama init, 
+            # model param for prepare_for_tool_use will be None
+        )
+
+        mock_expanduser.assert_called_once_with(self.model_path)
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, None
+        )
+        mock_llama_constructor.assert_called_once_with(
+            mock_expanduser.return_value, # expanded path
+            n_ctx=self.adapter.n_ctx,
+            n_gpu_layers=self.adapter.n_gpu_layers,
+            n_threads=self.adapter.n_threads,
+            verbose=False
+        )
+        mock_llama_instance.create_chat_completion.assert_called_once_with(
+            messages=self.prepared_payload["messages"],
+            temperature=self.prepared_payload["temperature"],
+            tools=self.prepared_payload["tools"],
+            tool_choice=self.prepared_payload["tool_choice"]
+        )
+        self.assertEqual(response, self.llm_response_dict)
+        # Check that _llm was deleted
+        self.assertFalse(hasattr(self.adapter, '_llm'))
+
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('llama_cpp.Llama')
+    @patch('os.path.expanduser', return_value=lambda x: x)
+    def test_execute_tool_interaction_with_passed_model_identifier(self, mock_expanduser, mock_llama_constructor, mock_prepare):
+        # This test verifies that if a 'model' string (not path) is passed to execute_tool_interaction,
+        # it is passed along to prepare_for_tool_use.
+        # The LlamaCPP adapter itself will still use its constructor-defined model *path*.
+        
+        override_model_identifier = "some-model-identifier"
+        # Update prepared_payload to reflect this override model for the assertion
+        prepared_payload_with_override = self.prepared_payload.copy()
+        prepared_payload_with_override["model"] = override_model_identifier
+        
+        mock_prepare.return_value = prepared_payload_with_override
+        mock_llama_instance = MagicMock()
+        mock_llama_instance.create_chat_completion.return_value = self.llm_response_dict
+        mock_llama_constructor.return_value = mock_llama_instance
+
+        self.adapter.execute_tool_interaction(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+            model=override_model_identifier # Pass a model identifier
+        )
+
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, override_model_identifier
+        )
+        # Llama constructor should still be called with the adapter's model path
+        mock_llama_constructor.assert_called_once_with(
+            mock_expanduser.return_value, # self.model_path after expanduser
+            n_ctx=self.adapter.n_ctx,
+            n_gpu_layers=self.adapter.n_gpu_layers,
+            n_threads=self.adapter.n_threads,
+            verbose=False
+        )
+
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('llama_cpp.Llama')
+    @patch('os.path.expanduser', return_value=lambda x: x)
+    def test_execute_tool_interaction_exception_in_llama(self, mock_expanduser, mock_llama_constructor, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload
+        # Simulate an error during Llama interaction
+        error_message = "Llama internal error"
+        mock_llama_constructor.side_effect = Exception(error_message) # Error on instantiation
+
+        with self.assertRaisesRegex(Exception, error_message):
+            self.adapter.execute_tool_interaction(
+                all_tools=self.sample_tools,
+                helper_prompt=self.helper_prompt,
+                user_prompt=self.user_prompt,
+                system_prompt=self.system_prompt
+            )
+        
+        # Test error during create_chat_completion
+        mock_llama_instance = MagicMock()
+        mock_llama_instance.create_chat_completion.side_effect = Exception("Chat completion failed")
+        mock_llama_constructor.side_effect = None # Reset side_effect
+        mock_llama_constructor.return_value = mock_llama_instance
+        
+        with self.assertRaisesRegex(Exception, "Chat completion failed"):
+            self.adapter.execute_tool_interaction(
+                all_tools=self.sample_tools,
+                helper_prompt=self.helper_prompt,
+                user_prompt=self.user_prompt,
+                system_prompt=self.system_prompt
+            )
+        # Ensure _llm is cleaned up even if create_chat_completion fails
+        self.assertFalse(hasattr(self.adapter, '_llm'))
+        mock_post.assert_called_once_with(self.base_url, json=self.prepared_payload_default_model)
+        self.assertEqual(response, self.llm_response_json)
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('requests.Session.post')
+    def test_execute_tool_interaction_success_with_override_model(self, mock_post, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload_override_model
+        mock_response = MagicMock()
+        mock_response.json.return_value = self.llm_response_json
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+        
+        override_model_name = "gpt-override"
+        response = self.adapter.execute_tool_interaction(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+            model=override_model_name # Override model specified
+        )
+
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, override_model_name
+        )
+        mock_post.assert_called_once_with(self.base_url, json=self.prepared_payload_override_model)
+        self.assertEqual(response, self.llm_response_json)
+
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('time.sleep', return_value=None) # Mock time.sleep
+    @patch('requests.Session.post')
+    def test_execute_tool_interaction_retry_on_429(self, mock_post, mock_sleep, mock_prepare):
+        # prepare_for_tool_use will be called twice, once for initial, once for retry
+        # Ensure it returns the correct payload each time, especially if model changes (it doesn't here)
+        mock_prepare.return_value = self.prepared_payload_default_model
+        
+        mock_response_429 = MagicMock()
+        mock_response_429.status_code = 429
+        # Crucially, the error's response attribute must be the mock_response_429 itself
+        http_error_429 = requests.exceptions.HTTPError("429 Client Error", response=mock_response_429)
+        mock_response_429.raise_for_status.side_effect = http_error_429 # Raise the error
+        
+        mock_response_success = MagicMock()
+        mock_response_success.json.return_value = self.llm_response_json
+        mock_response_success.raise_for_status = MagicMock() # Does not raise
+
+        mock_post.side_effect = [mock_response_429, mock_response_success]
+
+        response = self.adapter.execute_tool_interaction(
+            all_tools=self.sample_tools,
+            helper_prompt=self.helper_prompt,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt
+            # Uses default model
+        )
+        
+        # Check prepare was called for the default model on both occasions
+        mock_prepare.assert_any_call(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, self.default_model_name
+        )
+        self.assertEqual(mock_prepare.call_count, 2) 
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(10)
+        self.assertEqual(response, self.llm_response_json)
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('requests.Session.post')
+    def test_execute_tool_interaction_http_error_non_429(self, mock_post, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload_default_model
+        
+        mock_response_500 = MagicMock()
+        mock_response_500.status_code = 500
+        # Ensure the error's response attribute is set
+        http_error_500 = requests.exceptions.HTTPError("500 Server Error", response=mock_response_500)
+        mock_response_500.raise_for_status.side_effect = http_error_500
+        mock_post.return_value = mock_response_500
+
+        with self.assertRaises(requests.exceptions.HTTPError) as context:
+            self.adapter.execute_tool_interaction(
+                all_tools=self.sample_tools,
+                helper_prompt=self.helper_prompt,
+                user_prompt=self.user_prompt,
+                system_prompt=self.system_prompt
+            )
+        # Check that the raised exception is the one we created
+        self.assertIs(context.exception, http_error_500)
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, self.default_model_name
+        )
+
+    @patch('llm_tap.llm.prepare_for_tool_use')
+    @patch('requests.Session.post')
+    def test_execute_tool_interaction_request_exception(self, mock_post, mock_prepare):
+        mock_prepare.return_value = self.prepared_payload_default_model
+        connection_error = requests.exceptions.ConnectionError("Connection failed")
+        mock_post.side_effect = connection_error # Post call itself raises this
+
+        with self.assertRaises(requests.exceptions.ConnectionError) as context:
+            self.adapter.execute_tool_interaction(
+                all_tools=self.sample_tools,
+                helper_prompt=self.helper_prompt,
+                user_prompt=self.user_prompt,
+                system_prompt=self.system_prompt
+            )
+        self.assertIs(context.exception, connection_error)
+        mock_prepare.assert_called_once_with(
+            self.sample_tools, self.helper_prompt, self.user_prompt, self.system_prompt, self.default_model_name
+        )

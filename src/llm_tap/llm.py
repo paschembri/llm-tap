@@ -397,6 +397,52 @@ def prepare(data_class, prompt, system_prompt, model=None):
     return payload
 
 
+def prepare_for_tool_use(all_tools, helper_prompt, user_prompt, system_prompt, model=None):
+    """Prepares the payload for an LLM API call with multiple tools.
+
+    Args:
+        all_tools (list): A list of tool schemas.
+        helper_prompt (str): A helper prompt describing the tools or general instructions.
+        user_prompt (str): The user's prompt for the LLM.
+        system_prompt (str): The system prompt to guide the LLM's behavior.
+        model (str, optional): The specific model to use for the API call.
+                               Defaults to None.
+
+    Returns:
+        dict: The payload dictionary ready to be sent to an LLM API.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": helper_prompt, # Helper prompt added as a user message
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
+
+    payload = {
+        "messages": messages,
+        "tools": all_tools,
+        "tool_choice": "auto",  # LLM decides which tool to call
+        "parallel_tool_calls": False, # Assuming we don't want parallel calls for now
+        "temperature": 0.0,
+    }
+
+    if model is not None:
+        payload.update({"model": model})
+
+    logger.debug(
+        f"Prepared payload for tool use with user prompt '{user_prompt[:50]}...': {json.dumps(payload, indent=2)}"
+    )
+    return payload
+
+
 def parse_response(data_class, attributes):
     """Parses the LLM's response and converts it to a dataclass instance.
 
@@ -511,6 +557,49 @@ class HTTP:
         attributes = response.json()
         return parse_response(data_class, attributes)
 
+    def execute_tool_interaction(self, all_tools, helper_prompt, user_prompt, system_prompt="You are a helpful assistant that can use tools.", model=None):
+        """Sends a prompt to the LLM API for tool interaction and returns the raw response.
+
+        Args:
+            all_tools (list): A list of tool schemas.
+            helper_prompt (str): A helper prompt describing the tools or general instructions.
+            user_prompt (str): The user's prompt for the LLM.
+            system_prompt (str, optional): The system prompt.
+                                         Defaults to "You are a helpful assistant that can use tools.".
+            model (str, optional): The specific model to use. Defaults to class's self.model.
+
+        Returns:
+            dict: The JSON response from the LLM API.
+
+        Raises:
+            requests.exceptions.HTTPError: If the API returns an HTTP error status,
+                                           except for 429 (Too Many Requests),
+                                           which triggers a retry after a delay.
+        """
+        current_model = model if model is not None else self.model
+        payload = prepare_for_tool_use(all_tools, helper_prompt, user_prompt, system_prompt, current_model)
+        response = self.session.post(self.base_url, json=payload)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429:
+                logger.warning(
+                    f"Rate limit exceeded (429) for {self.base_url}. Retrying in 10 seconds..."
+                )
+                time.sleep(10)
+                # Retry with the same parameters
+                return self.execute_tool_interaction(
+                    all_tools, helper_prompt, user_prompt, system_prompt, current_model
+                )
+            logger.error(f"HTTP error during API call to {self.base_url}: {e}")
+            raise e
+        except requests.exceptions.RequestException as e:  # Catch other request errors
+            logger.error(
+                f"Request exception during API call to {self.base_url}: {e}"
+            )
+            raise e
+        return response.json()
+
 
 @dataclass
 class LLamaCPP:
@@ -586,5 +675,51 @@ class LLamaCPP:
         except Exception as e:  # Catch-all for llama.cpp related errors
             logger.error(
                 f"Error during LLamaCPP parsing for model {self.model}: {e}"
+            )
+            raise e
+
+    def execute_tool_interaction(self, all_tools, helper_prompt, user_prompt, system_prompt="You are a helpful assistant that can use tools.", model=None):
+        """Runs inference with a local llama.cpp model for tool interaction.
+
+        Args:
+            all_tools (list): A list of tool schemas.
+            helper_prompt (str): A helper prompt describing the tools or general instructions.
+            user_prompt (str): The user's prompt for the LLM.
+            system_prompt (str, optional): The system prompt.
+                                         Defaults to "You are a helpful assistant that can use tools.".
+            model (str, optional): The specific model string to pass to prepare_for_tool_use.
+                                   Note: LLamaCPP uses the model path from its constructor.
+
+        Returns:
+            dict: The response from the LLM.
+        """
+        model_path = os.path.expanduser(self.model) # self.model is the path for LlamaCPP
+        
+        # The 'model' parameter here is for the payload, prepare_for_tool_use can use it if needed
+        # but LlamaCPP itself will use model_path for loading.
+        payload = prepare_for_tool_use(all_tools, helper_prompt, user_prompt, system_prompt, model)
+
+        try:
+            # Suppress llama.cpp stdout/stderr messages
+            with open(os.devnull, "w") as fnull:
+                with redirect_stdout(fnull), redirect_stderr(fnull):
+                    self._llm = llama_cpp.Llama(
+                        model_path,
+                        n_ctx=self.n_ctx,
+                        n_gpu_layers=self.n_gpu_layers,
+                        n_threads=self.n_threads,
+                        verbose=False,
+                    )
+                    response = self._llm.create_chat_completion(
+                        messages=payload["messages"],
+                        temperature=payload.get("temperature", 0.0),
+                        tools=payload["tools"],
+                        tool_choice=payload["tool_choice"],
+                    )
+                    del self._llm  # Release the model resources
+            return response
+        except Exception as e:  # Catch-all for llama.cpp related errors
+            logger.error(
+                f"Error during LLamaCPP tool interaction for model {self.model}: {e}"
             )
             raise e

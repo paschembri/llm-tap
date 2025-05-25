@@ -405,6 +405,65 @@ class TestLLMInstanceInterface(unittest.TestCase):
         )
         self.assertEqual(result, 5.0)
 
+    def test_full_conceptual_flow_with_simulated_llm_tool_call(self):
+        """
+        Tests the conceptual flow:
+        1. Simulate receiving a raw LLM tool call response.
+        2. Manually extract the relevant 'function' part of a tool call.
+        3. Pass to parse_llm_action.
+        4. Pass results to execute_action.
+        5. Verify the outcome.
+        This test clarifies how LLMInstanceInterface methods are used with
+        an LLM response that would have come from a method like 'execute_tool_interaction'.
+        """
+        # 1. Simulate raw LLM response (as if from adapter.execute_tool_interaction)
+        simulated_raw_llm_response = {
+            "id": "chatcmpl-xxxxxxxx",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4-1106-preview",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None, # Usually null when tool_calls are present
+                    "tool_calls": [{
+                        "id": "call_thermo_set_temp",
+                        "type": "function",
+                        "function": {
+                            "name": "thermostat.set_temperature",
+                            "arguments": "{\"temperature\": 23.5, \"unit\": \"Fahrenheit\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }
+
+        # 2. Manually extract the relevant 'function' part (simulating user code)
+        # Assuming we are interested in the first tool call
+        tool_call_function_part = simulated_raw_llm_response["choices"][0]["message"]["tool_calls"][0]["function"]
+        
+        # This is what would be passed to parse_llm_action
+        self.assertEqual(tool_call_function_part["name"], "thermostat.set_temperature")
+        self.assertEqual(tool_call_function_part["arguments"], "{\"temperature\": 23.5, \"unit\": \"Fahrenheit\"}")
+
+        # 3. Pass to parse_llm_action
+        instance_id, method_name, args = self.interface.parse_llm_action(tool_call_function_part)
+        
+        # 4. Verify parse_llm_action output
+        self.assertEqual(instance_id, "thermostat")
+        self.assertEqual(method_name, "set_temperature")
+        self.assertEqual(args, {"temperature": 23.5, "unit": "Fahrenheit"})
+
+        # 5. Pass results to execute_action
+        execution_result = self.interface.execute_action(instance_id, method_name, args)
+
+        # 6. Verify the outcome
+        self.assertEqual(execution_result, "Temperature set to 23.5°Fahrenheit for main_thermo")
+        self.assertEqual(self.thermostat_instance.temp, 23.5)
+        self.assertEqual(self.thermostat_instance.unit, "Fahrenheit")
+
 
 if __name__ == "__main__":
     unittest.main(argv=["first-arg-is-ignored"], exit=False)
