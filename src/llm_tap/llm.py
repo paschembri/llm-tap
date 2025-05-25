@@ -42,7 +42,7 @@ def convert_field(cls, field_type):
     """Converts a Python type to its JSON schema representation.
 
     This function handles basic types, dataclasses, Enums, and generic types
-    like List, Dict, Union, etc. It uses a mapping for basic types and
+    like list, dict, Union, etc. It uses a mapping for basic types and
     recursively calls `to_json_schema` for nested dataclasses.
 
     Args:
@@ -101,7 +101,7 @@ def convert_field(cls, field_type):
 
             if len(items_type) != 1:
                 # For now, only support container types with a single type argument
-                # e.g. List[str], not Dict[str, int]
+                # e.g. list[str], not dict[str, int]
                 raise NotImplementedError(
                     f"Annotation not supported for {field_type}[{items_type}]"
                 )
@@ -174,7 +174,11 @@ def to_json_schema(data_class):
             required_fields.append(f.name)
 
     data_class_name = data_class.__name__
-    data_class_docstring = dedent(data_class.__doc__).strip() if data_class.__doc__ else data_class.__name__
+    data_class_docstring = (
+        dedent(data_class.__doc__).strip()
+        if data_class.__doc__
+        else data_class.__name__
+    )
 
     schema = {
         "type": "object",
@@ -183,7 +187,9 @@ def to_json_schema(data_class):
         "properties": properties,
         "required": required_fields,
     }
-    logger.debug(f"Generated JSON schema for {data_class_name}: {json.dumps(schema, indent=2)}")
+    logger.debug(
+        f"Generated JSON schema for {data_class_name}: {json.dumps(schema, indent=2)}"
+    )
     return schema
 
 
@@ -197,7 +203,7 @@ def from_dict(cls, attrs):
 
     Args:
         cls: The target class or type to convert the dictionary into.
-             Can be a dataclass, a type hint (like Union, List), or an Enum.
+             Can be a dataclass, a type hint (like Union, list), or an Enum.
         attrs: The dictionary of attributes to use for creating the instance.
 
     Returns:
@@ -243,7 +249,9 @@ def from_dict(cls, attrs):
         except StopIteration:
             raise KeyError(f"Class {attrs['name']} not found in Union {cls}")
 
-        instance = target_cls(**attrs["arguments"])  # Instantiate the chosen class
+        instance = target_cls(
+            **attrs["arguments"]
+        )  # Instantiate the chosen class
 
         return instance
 
@@ -383,7 +391,9 @@ def prepare(data_class, prompt, system_prompt, model=None):
     if model is not None:
         payload.update({"model": model})
 
-    logger.debug(f"Prepared payload for {data_class.__name__} with prompt '{prompt[:50]}...': {json.dumps(payload, indent=2)}")
+    logger.debug(
+        f"Prepared payload for {data_class.__name__} with prompt '{prompt[:50]}...': {json.dumps(payload, indent=2)}"
+    )
     return payload
 
 
@@ -408,11 +418,17 @@ def parse_response(data_class, attributes):
         arguments_json = tool_call["function"]["arguments"]
         arguments_dict = json.loads(arguments_json)
         instance = from_dict(data_class, arguments_dict)
-        logger.info(f"Successfully parsed response into an instance of {data_class.__name__}")
+        logger.info(
+            f"Successfully parsed response into an instance of {data_class.__name__}"
+        )
         return instance
     except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.error(f"Error parsing LLM response for {data_class.__name__}: {e}. Response attributes: {attributes}")
-        raise ValueError(f"LLM output malformed or missing expected tool_call/arguments: {attributes}") from e
+        logger.error(
+            f"Error parsing LLM response for {data_class.__name__}: {e}. Response attributes: {attributes}"
+        )
+        raise ValueError(
+            f"LLM output malformed or missing expected tool_call/arguments: {attributes}"
+        ) from e
 
 
 @dataclass
@@ -476,13 +492,21 @@ class HTTP:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             if response.status_code == 429:
-                logger.warning(f"Rate limit exceeded (429) for {self.base_url}. Retrying in 10 seconds...")
+                logger.warning(
+                    f"Rate limit exceeded (429) for {self.base_url}. Retrying in 10 seconds..."
+                )
                 time.sleep(10)
-                return self.parse(data_class, prompt, system_prompt) # Pass system_prompt for retry
+                return self.parse(
+                    data_class, prompt, system_prompt
+                )  # Pass system_prompt for retry
             logger.error(f"HTTP error during API call to {self.base_url}: {e}")
             raise e
-        except requests.exceptions.RequestException as e: # Catch other request errors like ConnectionError
-            logger.error(f"Request exception during API call to {self.base_url}: {e}")
+        except (
+            requests.exceptions.RequestException
+        ) as e:  # Catch other request errors like ConnectionError
+            logger.error(
+                f"Request exception during API call to {self.base_url}: {e}"
+            )
             raise e
         attributes = response.json()
         return parse_response(data_class, attributes)
@@ -506,7 +530,9 @@ class LLamaCPP:
         n_threads (int): Number of threads to use for generation. Defaults to 1.
     """
 
-    model: str = "/path/to/any/gguf/model"  # Placeholder, user should change this
+    model: str = (
+        "/path/to/any/gguf/model"  # Placeholder, user should change this
+    )
     n_ctx: int = 4_000
     n_gpu_layers: int = 100
     n_threads: int = 1
@@ -549,12 +575,16 @@ class LLamaCPP:
 
                     response = self._llm.create_chat_completion(
                         messages=payload["messages"],
-                        temperature=payload["temperature"],  # Typically 0.0 for structured output
+                        temperature=payload[
+                            "temperature"
+                        ],  # Typically 0.0 for structured output
                         tools=payload["tools"],
                         tool_choice=payload["tool_choice"],
                     )
                     del self._llm  # Release the model resources
             return parse_response(data_class, response)
-        except Exception as e: # Catch-all for llama.cpp related errors
-            logger.error(f"Error during LLamaCPP parsing for model {self.model}: {e}")
+        except Exception as e:  # Catch-all for llama.cpp related errors
+            logger.error(
+                f"Error during LLamaCPP parsing for model {self.model}: {e}"
+            )
             raise e
