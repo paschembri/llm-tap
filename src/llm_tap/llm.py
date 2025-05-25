@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
+"""Core module for llm-tap, providing functionalities for interacting with LLMs.
+
+This module includes:
+    - Conversion of Python data classes to JSON schemas.
+    - Adapters for various LLM backends (HTTP, llama.cpp).
+    - Helper functions for preparing prompts and parsing responses.
+"""
 import time
 import os
 import typing
 import types
 import json
+import logging
 
 from functools import lru_cache
 from inspect import isclass
@@ -23,11 +31,32 @@ import llama_cpp
 from contextlib import redirect_stdout, redirect_stderr
 
 
+# Initialize logger
+logger = logging.getLogger(__name__)
+
 class_names_mapping = {}
 
 
 @lru_cache
 def convert_field(cls, field_type):
+    """Converts a Python type to its JSON schema representation.
+
+    This function handles basic types, dataclasses, Enums, and generic types
+    like List, Dict, Union, etc. It uses a mapping for basic types and
+    recursively calls `to_json_schema` for nested dataclasses.
+
+    Args:
+        cls: The class containing the field (used for handling self-references).
+        field_type: The Python type to convert.
+
+    Returns:
+        dict: The JSON schema representation of the field_type.
+
+    Raises:
+        NotImplementedError: If a container type with multiple type arguments
+                             is encountered (e.g., Dict[str, int, str]).
+        ValueError: If an unknown field type string is encountered.
+    """
     class_name = cls.__name__
 
     mapping = {
@@ -71,11 +100,13 @@ def convert_field(cls, field_type):
             items_type = field_type.__args__
 
             if len(items_type) != 1:
+                # For now, only support container types with a single type argument
+                # e.g. List[str], not Dict[str, int]
                 raise NotImplementedError(
                     f"Annotation not supported for {field_type}[{items_type}]"
                 )
 
-            items_type = items_type[0]
+            items_type = items_type[0]  # Get the inner type
 
             items = convert_field(cls, items_type)
 
@@ -100,11 +131,15 @@ def convert_field(cls, field_type):
 
         elif type(field_type) is str:
             if field_type == class_name:
+                # Handle self-referencing types
                 return {"$ref": "#"}
             else:
+                # This case might occur if a string literal for a type hint
+                # is used for a class not yet defined or not in class_names_mapping
                 raise ValueError(f"Unknown field type: {field_type}")
 
         else:
+            # Default to object type if no other match
             return {
                 "type": "object",
             }
@@ -112,6 +147,17 @@ def convert_field(cls, field_type):
 
 @lru_cache
 def to_json_schema(data_class):
+    """Converts a Python dataclass to its JSON schema representation.
+
+    The schema includes title, description (from docstring), properties,
+    and required fields.
+
+    Args:
+        data_class: The Python dataclass to convert.
+
+    Returns:
+        dict: The JSON schema representation of the dataclass.
+    """
     properties = {}
     required_fields = []
 
@@ -128,18 +174,40 @@ def to_json_schema(data_class):
             required_fields.append(f.name)
 
     data_class_name = data_class.__name__
-    data_class_docstring = dedent(data_class.__doc__).strip()
+    data_class_docstring = dedent(data_class.__doc__).strip() if data_class.__doc__ else data_class.__name__
 
-    return {
+    schema = {
         "type": "object",
         "title": data_class_name,
         "description": data_class_docstring,
         "properties": properties,
         "required": required_fields,
     }
+    logger.debug(f"Generated JSON schema for {data_class_name}: {json.dumps(schema, indent=2)}")
+    return schema
 
 
 def from_dict(cls, attrs):
+    """Recursively converts a dictionary to an instance of a given class.
+
+    This function is the inverse of `to_json_schema` in a way,
+    reconstructing Python objects from a dictionary representation,
+    presumably parsed from a JSON. It handles dataclasses,
+    unions, container types (list, tuple, set, frozenset), and Enums.
+
+    Args:
+        cls: The target class or type to convert the dictionary into.
+             Can be a dataclass, a type hint (like Union, List), or an Enum.
+        attrs: The dictionary of attributes to use for creating the instance.
+
+    Returns:
+        An instance of `cls` populated with data from `attrs`.
+
+    Raises:
+        ValueError: If `cls` is a string and not found in `class_names_mapping`.
+        KeyError: If a 'name' key in `attrs` for a Union type does not
+                  correspond to any of the Union's arguments.
+    """
     containers = (
         list,
         tuple,
@@ -163,6 +231,9 @@ def from_dict(cls, attrs):
         and cls.__origin__ is typing.Union
     ):
         try:
+            # For Union types, attrs is expected to have a 'name' field
+            # indicating which class in the Union to instantiate,
+            # and an 'arguments' field for its constructor arguments.
             target_cls = next(
                 filter(
                     lambda target_cls: target_cls.__name__ == attrs["name"],
@@ -170,9 +241,9 @@ def from_dict(cls, attrs):
                 )
             )
         except StopIteration:
-            raise KeyError(f"Class {attrs['name']} not found")
+            raise KeyError(f"Class {attrs['name']} not found in Union {cls}")
 
-        instance = target_cls(**attrs["arguments"])
+        instance = target_cls(**attrs["arguments"])  # Instantiate the chosen class
 
         return instance
 
@@ -193,6 +264,15 @@ def from_dict(cls, attrs):
 
 
 def as_tool(json_schema):
+    """Formats a JSON schema into an OpenAI tool specification.
+
+    Args:
+        json_schema (dict): The JSON schema of the tool's parameters.
+                            Typically generated by `to_json_schema`.
+
+    Returns:
+        dict: An OpenAI tool specification dictionary.
+    """
     return {
         "type": "function",
         "function": {
@@ -204,13 +284,37 @@ def as_tool(json_schema):
 
 
 def as_tool_choice(json_schema):
+    """Creates an OpenAI tool_choice dictionary for a given JSON schema.
+
+    This is used to specify which tool (function) the LLM should call.
+
+    Args:
+        json_schema (dict): The JSON schema of the tool, typically from
+                            `to_json_schema`. The 'title' field of the
+                            schema is used as the function name.
+
+    Returns:
+        dict: An OpenAI tool_choice dictionary.
+    """
     return {"type": "function", "function": {"name": json_schema["title"]}}
 
 
 @lru_cache
 def make_helper(data_class):
+    """Generates a string representation of a dataclass for LLM prompts.
+
+    This helper string includes the class name, its description (from docstring),
+    and a list of its fields with their types and requirement status.
+    This is used to guide the LLM in generating structured output.
+
+    Args:
+        data_class: The dataclass to generate the helper string for.
+
+    Returns:
+        str: A formatted string describing the dataclass structure.
+    """
     class_name = f"name: {data_class.__name__}"
-    class_description = f"description: {dedent(data_class.__doc__.strip())}"
+    class_description = f"description: {dedent(data_class.__doc__.strip()) if data_class.__doc__ else data_class.__name__}"
 
     inputs_schema = []
 
@@ -237,6 +341,21 @@ def make_helper(data_class):
 
 @lru_cache
 def prepare(data_class, prompt, system_prompt, model=None):
+    """Prepares the payload for an LLM API call.
+
+    This function constructs the messages list, tool specifications,
+    and other parameters required for an LLM API request.
+
+    Args:
+        data_class: The dataclass representing the expected structured output.
+        prompt (str): The user's prompt for the LLM.
+        system_prompt (str): The system prompt to guide the LLM's behavior.
+        model (str, optional): The specific model to use for the API call.
+                               Defaults to None.
+
+    Returns:
+        dict: The payload dictionary ready to be sent to an LLM API.
+    """
     data_class_schema = to_json_schema(data_class)
     data_class_tool = as_tool(data_class_schema)
     data_class_tool_choice = as_tool_choice(data_class_schema)
@@ -264,21 +383,55 @@ def prepare(data_class, prompt, system_prompt, model=None):
     if model is not None:
         payload.update({"model": model})
 
+    logger.debug(f"Prepared payload for {data_class.__name__} with prompt '{prompt[:50]}...': {json.dumps(payload, indent=2)}")
     return payload
 
 
 def parse_response(data_class, attributes):
-    tool_call = attributes["choices"][0]["message"]["tool_calls"][0]
-    arguments_json = tool_call["function"]["arguments"]
-    arguments_dict = json.loads(arguments_json)
-    instance = from_dict(data_class, arguments_dict)
-    return instance
+    """Parses the LLM's response and converts it to a dataclass instance.
+
+    Assumes the response contains a tool call with function arguments
+    in JSON format.
+
+    Args:
+        data_class: The target dataclass to instantiate with the parsed data.
+        attributes (dict): The raw response dictionary from the LLM API.
+                           Expected to follow OpenAI's chat completion format.
+
+    Returns:
+        An instance of `data_class` populated with data from the LLM's response.
+    """
+    try:
+        # Extract the tool call from the response
+        tool_call = attributes["choices"][0]["message"]["tool_calls"][0]
+        # Extract the JSON string of arguments from the tool call
+        arguments_json = tool_call["function"]["arguments"]
+        arguments_dict = json.loads(arguments_json)
+        instance = from_dict(data_class, arguments_dict)
+        logger.info(f"Successfully parsed response into an instance of {data_class.__name__}")
+        return instance
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        logger.error(f"Error parsing LLM response for {data_class.__name__}: {e}. Response attributes: {attributes}")
+        raise ValueError(f"LLM output malformed or missing expected tool_call/arguments: {attributes}") from e
 
 
 @dataclass
 class HTTP:
-    """
-    OpenAI API Compatible adapter using `requests` library.
+    """HTTP adapter for interacting with OpenAI-compatible LLM APIs.
+
+    This class provides a convenient way to send requests to an LLM API
+    endpoint using HTTP POST requests. It handles request preparation,
+    sending the request, and parsing the response.
+
+    Attributes:
+        base_url (str): The base URL of the LLM API endpoint.
+                        Defaults to the value of the "ENDPOINT" environment variable.
+        api_key (str): The API key for authentication.
+                       Defaults to the value of the "API_KEY" environment variable.
+        model (str): The default model to use for requests.
+                     Defaults to the value of the "DEFAULT_MODEL" environment variable.
+        session (requests.Session): The requests session object used for making
+                                    HTTP requests.
     """
 
     base_url: str = os.getenv("ENDPOINT")
@@ -301,14 +454,35 @@ class HTTP:
         pass
 
     def parse(self, data_class, prompt="", system_prompt="Answer in JSON"):
+        """Sends a prompt to the LLM API and parses the structured response.
+
+        Args:
+            data_class: The dataclass to structure the LLM's response into.
+            prompt (str, optional): The user prompt. Defaults to "".
+            system_prompt (str, optional): The system prompt.
+                                         Defaults to "Answer in JSON".
+
+        Returns:
+            An instance of `data_class` populated with the LLM's response.
+
+        Raises:
+            requests.exceptions.HTTPError: If the API returns an HTTP error status,
+                                           except for 429 (Too Many Requests),
+                                           which triggers a retry after a delay.
+        """
         payload = prepare(data_class, prompt, system_prompt, self.model)
         response = self.session.post(self.base_url, json=payload)
         try:
             response.raise_for_status()
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
             if response.status_code == 429:
+                logger.warning(f"Rate limit exceeded (429) for {self.base_url}. Retrying in 10 seconds...")
                 time.sleep(10)
-                return self.parse(data_class, prompt)
+                return self.parse(data_class, prompt, system_prompt) # Pass system_prompt for retry
+            logger.error(f"HTTP error during API call to {self.base_url}: {e}")
+            raise e
+        except requests.exceptions.RequestException as e: # Catch other request errors like ConnectionError
+            logger.error(f"Request exception during API call to {self.base_url}: {e}")
             raise e
         attributes = response.json()
         return parse_response(data_class, attributes)
@@ -316,11 +490,23 @@ class HTTP:
 
 @dataclass
 class LLamaCPP:
-    """
-    llama.cpp wrapper using llama-cpp-python
+    """Adapter for interacting with local LLMs using llama.cpp via llama-cpp-python.
+
+    This class allows running inference on GGUF models locally. It handles
+    loading the model, preparing the prompt, running inference, and parsing
+    the structured response.
+
+    Attributes:
+        model (str): Path to the GGUF model file.
+                     Defaults to "/path/to/any/gguf/model".
+                     It's recommended to change this to an actual model path.
+        n_ctx (int): The context size for the model. Defaults to 4000.
+        n_gpu_layers (int): Number of layers to offload to GPU.
+                            Defaults to 100 (may need adjustment based on GPU VRAM).
+        n_threads (int): Number of threads to use for generation. Defaults to 1.
     """
 
-    model: str = "/path/to/any/gguf/model"
+    model: str = "/path/to/any/gguf/model"  # Placeholder, user should change this
     n_ctx: int = 4_000
     n_gpu_layers: int = 100
     n_threads: int = 1
@@ -335,24 +521,40 @@ class LLamaCPP:
         pass
 
     def parse(self, data_class, prompt="", system_prompt="Answer in JSON"):
+        """Runs inference with a local llama.cpp model and parses the structured response.
+
+        Args:
+            data_class: The dataclass to structure the LLM's response into.
+            prompt (str, optional): The user prompt. Defaults to "".
+            system_prompt (str, optional): The system prompt.
+                                         Defaults to "Answer in JSON".
+
+        Returns:
+            An instance of `data_class` populated with the LLM's response.
+        """
         model_path = os.path.expanduser(self.model)
         payload = prepare(data_class, prompt, system_prompt)
 
-        with open(os.devnull, "w") as fnull:
-            with redirect_stdout(fnull), redirect_stderr(fnull):
-                self._llm = llama_cpp.Llama(
-                    model_path,
-                    n_ctx=self.n_ctx,
-                    n_gpu_layers=self.n_gpu_layers,
-                    n_threads=self.n_threads,
-                    verbose=False,
-                )
+        try:
+            # Suppress llama.cpp stdout/stderr messages during model loading and inference
+            with open(os.devnull, "w") as fnull:
+                with redirect_stdout(fnull), redirect_stderr(fnull):
+                    self._llm = llama_cpp.Llama(
+                        model_path,
+                        n_ctx=self.n_ctx,
+                        n_gpu_layers=self.n_gpu_layers,
+                        n_threads=self.n_threads,
+                        verbose=False,  # Disable verbose logging from llama_cpp.Llama
+                    )
 
-                response = self._llm.create_chat_completion(
-                    messages=payload["messages"],
-                    temperature=payload["temperature"],
-                    tools=payload["tools"],
-                    tool_choice=payload["tool_choice"],
-                )
-                del self._llm
-        return parse_response(data_class, response)
+                    response = self._llm.create_chat_completion(
+                        messages=payload["messages"],
+                        temperature=payload["temperature"],  # Typically 0.0 for structured output
+                        tools=payload["tools"],
+                        tool_choice=payload["tool_choice"],
+                    )
+                    del self._llm  # Release the model resources
+            return parse_response(data_class, response)
+        except Exception as e: # Catch-all for llama.cpp related errors
+            logger.error(f"Error during LLamaCPP parsing for model {self.model}: {e}")
+            raise e
